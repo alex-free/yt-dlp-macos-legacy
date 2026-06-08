@@ -1,0 +1,150 @@
+#!/bin/bash
+
+set -e
+version=1.0-2026.03.17
+release_name=yt-dlp-macos-legacy-v$version
+
+# ffmpeg static downloads uses https://evermeet.cx. Since this site deleted older snapshots for commit-specific compilations: https://deolaha.ca/pub/ffmpeg/snapshots/ need to use a 'release' that is older then the cut off date to work. ffmpeg-7.0.2.zip with upload date of 2024-08-03 08:16 is before the last Mac OS X 10.9 commit-specific release: ffmpeg-116991-ga15d2fdfd9 - 2024-09-11 so I'll go with that. Found on https://deolaha.ca/pub/ffmpeg.
+# Current release requires Mac OS X 10.13 - https://evermeet.cx/ffmpeg/getrelease/zip.
+
+ffmpeg_dl=https://deolaha.ca/pub/ffmpeg/ffmpeg-7.0.2.zip
+
+rm -rf $release_name*
+
+if [[ "$1" == "clean" ]]; then
+    exit 1
+fi
+
+# When this script exits, automatically delete the temp directory.
+cleanup()
+{
+    if [[ -e "$tmp" ]]; then
+        rm -r "$tmp"
+    fi
+}
+trap cleanup EXIT
+
+# Put temp directory in /var/tmp to guarantee enough space.
+tmp=$(mktemp -d /var/tmp/yt-dlp-macos-legacy.XXXXXX)
+
+# Install yt-dlp
+sudo port -N selfupdate
+sudo port -N install yt-dlp curl python314
+
+# Get latest ffmpeg static
+curl -L "$ffmpeg_dl" -o $tmp/ffmpeg.zip
+unzip $tmp/ffmpeg.zip -d "$tmp"
+
+# Remove code signature from ffmpeg.
+codesign --remove-signature $tmp/ffmpeg
+
+# Remove quarintine from ffmpeg. Doesn't have it now, but future proof maybe?
+xattr -d com.apple.quarantine $tmp/ffmpeg || true
+
+# Update if needed, current one as of right now...
+sudo port select --set python3 python314
+
+# Set up virtual environment in temp.
+python3 -m venv "$tmp"
+source "$tmp/bin/activate"
+
+# install in virtual environment
+pip install --upgrade pip
+pip install pyinstaller yt-dlp mutagen pycryptodomex brotli certifi
+
+# SSL Certs.
+yt_dlp_filepath=$(which yt-dlp)
+certifi_cert_bundle=$(python3 -c "import certifi; print(certifi.where())")
+
+# Runtime hooks to automatically set the SSL path and point to ffmpeg at startup.
+hook="./pyi_ssl_hook.py"
+# Write hook.
+cat << 'EOF' > $hook
+import os
+import sys
+
+# PyInstaller extracts everything to sys._MEIPASS at runtime
+if hasattr(sys, '_MEIPASS'):
+    # SSL cert.
+    cert_path = os.path.join(sys._MEIPASS, 'cacert.pem')
+    os.environ['SSL_CERT_FILE'] = cert_path
+    os.environ['WEBSOCKET_CLIENT_CA_BUNDLE'] = cert_path
+
+    # Point to internal binaries for FFmpeg.
+    os.environ['PATH'] = sys._MEIPASS + os.pathsep + os.environ.get('PATH', '')
+EOF
+
+# Do this because codesign has different syntax on Mac OS 10.12 that pyinstaller is incompatile with.
+spec_file="$tmp/yt-dlp.spec"
+
+cat << EOF > "$spec_file"
+import PyInstaller.utils.osx as osx
+
+def dummy_bypass(*args, **kwargs):
+    print("--- SKIPPING PYINSTALLER CODESIGN ATTEMPTS ---")
+    return
+
+# Override internal PyInstaller mechanisms completely
+osx.fix_exe_for_code_signing = dummy_bypass
+osx.sign_binary = dummy_bypass
+# ------------------------------------------------
+
+block_cipher = None
+
+a = Analysis(
+    ['$yt_dlp_filepath'],
+    pathex=[],
+    binaries=[],
+    datas=[('${certifi_cert_bundle}', '.'), ('$tmp/ffmpeg', '.')],
+    hiddenimports=['yt_dlp.compat', 'mutagen', 'Cryptodome', 'brotli', 'certifi'],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=['$hook'],
+    excludes=[],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    [],
+    name='yt-dlp',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch='x86_64',
+    codesign_identity=None,  # Handled by monkey patch anyway
+    entitlements_file=None,
+)
+EOF
+
+# Empty identity to cover environment hooks.
+export PYI_CODESIGN_IDENTITY=""
+pyinstaller --clean --workpath "$tmp/build" --distpath "$tmp" "$spec_file"
+
+# Close virtual enviorement.
+deactivate
+
+# Gen release.
+mkdir $release_name
+mv $tmp/yt-dlp $release_name
+
+cp -v *.md $release_name
+chmod -R 777 $release_name
+zip -r $release_name.zip $release_name
+
+
