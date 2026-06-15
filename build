@@ -27,8 +27,16 @@ trap cleanup EXIT
 # Put temp directory in /var/tmp to guarantee enough space.
 tmp=$(mktemp -d /var/tmp/yt-dlp-macos-legacy.XXXXXX)
 
-# Install yt-dlp
+# Find new ports.
 sudo port -N selfupdate
+
+# Patch Libheif: https://github.com/macports/macports-ports/pull/33032
+sudo sed -i '' 's|if {\${os.major} < 11} {|if {\${os.major} < 17} {|' /opt/local/var/macports/sources/rsync.macports.org/macports/release/tarballs/ports/multimedia/libheif/Portfile > /dev/null 2>&1
+
+# Upgrade anything outdated to latest.
+sudo port -N upgrade outdated
+
+# Make sure build deps installed.
 sudo port -N install yt-dlp curl python314
 
 # Get latest ffmpeg static
