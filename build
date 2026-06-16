@@ -1,7 +1,8 @@
 #!/bin/bash
 
 set -e
-version=1.0-2026.03.17
+version=1.0.1-2026.06.09
+# Grab yt-dlp version.
 release_name=yt-dlp-macos-legacy-v$version
 
 # ffmpeg static downloads uses https://evermeet.cx. Since this site deleted older snapshots for commit-specific compilations: https://deolaha.ca/pub/ffmpeg/snapshots/ need to use a 'release' that is older then the cut off date to work. ffmpeg-7.0.2.zip with upload date of 2024-08-03 08:16 is before the last Mac OS X 10.9 commit-specific release: ffmpeg-116991-ga15d2fdfd9 - 2024-09-11 so I'll go with that. Found on https://deolaha.ca/pub/ffmpeg.
@@ -30,8 +31,9 @@ tmp=$(mktemp -d /var/tmp/yt-dlp-macos-legacy.XXXXXX)
 # Find new ports.
 sudo port -N selfupdate
 
-# Patch Libheif: https://github.com/macports/macports-ports/pull/33032
-sudo sed -i '' 's|if {\${os.major} < 11} {|if {\${os.major} < 17} {|' /opt/local/var/macports/sources/rsync.macports.org/macports/release/tarballs/ports/multimedia/libheif/Portfile > /dev/null 2>&1
+echo "Patching libheif..."
+# Patch Libheif: https://github.com/macports/macports-ports/pull/33032.
+sudo sed -i '' 's|if {\${os.major} < 11} {|if {\${os.major} < 17} {|' /opt/local/var/macports/sources/rsync.macports.org/macports/release/tarballs/ports/multimedia/libheif/Portfile
 
 # Upgrade anything outdated to latest.
 sudo port -N upgrade outdated
@@ -39,33 +41,37 @@ sudo port -N upgrade outdated
 # Make sure build deps installed.
 sudo port -N install yt-dlp curl python314
 
-# Get latest ffmpeg static
+# Get latest ffmpeg static.
 curl -L "$ffmpeg_dl" -o $tmp/ffmpeg.zip
-unzip $tmp/ffmpeg.zip -d "$tmp"
+unzip $tmp/ffmpeg.zip -d $tmp
 
 # Remove code signature from ffmpeg.
 codesign --remove-signature $tmp/ffmpeg
 
-# Remove quarintine from ffmpeg. Doesn't have it now, but future proof maybe?
-xattr -d com.apple.quarantine $tmp/ffmpeg || true
+# Remove quarintine from ffmpeg if it has it.
+xattr -d com.apple.quarantine $tmp/ffmpeg > /dev/null 2>&1 || true
 
 # Update if needed, current one as of right now...
 sudo port select --set python3 python314
 
 # Set up virtual environment in temp.
-python3 -m venv "$tmp"
-source "$tmp/bin/activate"
+virtual_env=$tmp/env
+python3 -m venv $virtual_env
+source $virtual_env/bin/activate
 
-# install in virtual environment
+# Install in virtual environment.
 pip install --upgrade pip
 pip install pyinstaller yt-dlp mutagen pycryptodomex brotli certifi
 
+# Nothing can be signed when going into pyinstaller, but these are already ad hoc from Macports. Ugly hack, but this has wasted too much of my time.
+cp -v osx.py.modified $virtual_env/lib/python3.14/site-packages/PyInstaller/utils/osx.py
+
 # SSL Certs.
-yt_dlp_filepath=$(which yt-dlp)
 certifi_cert_bundle=$(python3 -c "import certifi; print(certifi.where())")
 
 # Runtime hooks to automatically set the SSL path and point to ffmpeg at startup.
-hook="./pyi_ssl_hook.py"
+hook=$tmp/pyi_ssl_hook.py
+
 # Write hook.
 cat << 'EOF' > $hook
 import os
@@ -82,74 +88,58 @@ if hasattr(sys, '_MEIPASS'):
     os.environ['PATH'] = sys._MEIPASS + os.pathsep + os.environ.get('PATH', '')
 EOF
 
-# Do this because codesign has different syntax on Mac OS 10.12 that pyinstaller is incompatile with.
-spec_file="$tmp/yt-dlp.spec"
-
-cat << EOF > "$spec_file"
-import PyInstaller.utils.osx as osx
-
-def dummy_bypass(*args, **kwargs):
-    print("--- SKIPPING PYINSTALLER CODESIGN ATTEMPTS ---")
-    return
-
-# Override internal PyInstaller mechanisms completely
-osx.fix_exe_for_code_signing = dummy_bypass
-osx.sign_binary = dummy_bypass
-# ------------------------------------------------
-
-block_cipher = None
+# Write spec file.
+cat << EOF > $tmp/yt-dlp.spec
+# -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
-    ['$yt_dlp_filepath'],
-    pathex=[],
-    binaries=[],
-    datas=[('${certifi_cert_bundle}', '.'), ('$tmp/ffmpeg', '.')],
-    hiddenimports=['yt_dlp.compat', 'mutagen', 'Cryptodome', 'brotli', 'certifi'],
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=['$hook'],
-    excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
+    ['$(which yt-dlp)'],
+    binaries=[
+        ('$tmp/ffmpeg', '.'),
+    ],
+    datas=[
+        ('$certifi_cert_bundle', '.'),
+    ],
     noarchive=False,
+    runtime_hooks=['$hook'], # Points to your custom script
+    codesign_identity='',      # ADDED HERE: Force ad-hoc for all binary dependencies
+    codesign_options=[],        # ADDED HERE: Strips runtime option from internal cached .so files
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
+    a.binaries, # Positions Python internal .so files here
     a.datas,
     [],
     name='yt-dlp',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=True,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch='x86_64',
-    codesign_identity=None,  # Handled by monkey patch anyway
-    entitlements_file=None,
+    target_arch='x86_64',       # Added quotes around the string
+    #codesign_identity='',      # Force ad-hoc
+    codesign_options=[],        # Strips out --options=runtime to fix crash
 )
 EOF
 
-# Empty identity to cover environment hooks.
-export PYI_CODESIGN_IDENTITY=""
-pyinstaller --clean --workpath "$tmp/build" --distpath "$tmp" "$spec_file"
+# Move bincache to deletable tmp. Pyinstaller keeps this around for dumb reasons.
+mkdir $tmp/cache
+export PYINSTALLER_CONFIG_DIR=$tmp/cache
+pyinstaller \
+    --workpath $virtual_env/build \
+    --distpath $virtual_env \
+    $tmp/yt-dlp.spec
 
 # Close virtual enviorement.
 deactivate
 
+cd "$(dirname "$0")"
+
 # Gen release.
 mkdir $release_name
-mv $tmp/yt-dlp $release_name
+mv $virtual_env/yt-dlp $release_name
 
 cp -v *.md $release_name
 chmod -R 777 $release_name
